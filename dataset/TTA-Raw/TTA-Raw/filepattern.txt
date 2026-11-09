@@ -1,0 +1,3 @@
+#str_str_int_int_int
+.+[\\\/]TTA-Raw_(?P<led_type>[^_]+)_(?P<solder>.+)_Panel(?P<panel_number>\d)_LED(?P<led_number>\d\d)_(?P<cycle>\d\d\d\d)TSC.TTAcool
+.+[\\\/]TTA-Raw_(?P<led_type>[^_]+)_(?P<solder>.+)_Panel(?P<panel_number>\d)_LED(?P<led_number>\d\d)_(?P<cycle>\d\d\d\d)TSC.err

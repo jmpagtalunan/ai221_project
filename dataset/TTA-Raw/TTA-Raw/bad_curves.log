@@ -1,0 +1,27 @@
+#str_str_int_int_int
+#LED type, solder, panel, LED number, cycle
+
+ LUMILEDS,	Indium,		2,	6,	 1250
+ SEOUL,		Indium,		3,	10,	 1000
+ Nichia131,	Indium,		4,	2,	 1250
+ Nichia131,	InnoLot,	1,	1,	 1500
+ Nichia131,	InnoLot,	1,	3,	 1500
+ Nichia170,	InnoLot,	3,	9,	 1000
+ Nichia131,	InnoLot,	4,	6,	 1500
+ SEOUL,		SAC305,		2,	7,	 1500
+ Dominant,	Indium,		4,	6,	 1500
+ Dominant,	Senju,		2,	6,	 1000
+ Dominant,	Senju,		2,	6,	 1500
+ CREE,		Senju,		3,	4,	 1500
+ LUMILEDS,	Senju,		3,	3,	 1000
+				
+ Nichia131,	InnoLot,	2,	3,	 1250
+ Nichia131,	InnoLot,	2,	4,	 1250
+ Nichia131,	InnoLot,	2,	5,	 1250
+ SEOUL,		InnoLot,	2,	2,	 1000  
+ Nichia131,	InnoLot,	3,	7,	 1250
+ Nichia131,	InnoLot,	3,	8,	 1250
+ Nichia131,	InnoLot,	3,	10,	 1250
+ Nichia170,	InnoLot,	3,	9,	 1250
+ Nichia170,	InnoLot,	3,	9,	 750
+ Nichia131,	InnoLot,	4,	5,	 1250
