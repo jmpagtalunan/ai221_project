@@ -1,0 +1,683 @@
+\documentclass[11pt,a4paper]{article}
+
+% ---------------------------------------------------------------------------
+% Spatial Void Feature Extraction from X-ray Images
+% Companion document to notebooks/jp_void_spatial_features.ipynb
+% AI 221 Project -- Machine Learning-Based Classification of Thermal
+% Resistance Degradation in Solder Joints Using Void Spatial Distribution
+% Features from X-ray Images
+% ---------------------------------------------------------------------------
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{ragged2e}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{float}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+
+% column types for the long tables
+\newcolumntype{L}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+
+% inline code style
+\definecolor{codegray}{gray}{0.95}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  breaklines=true,
+  frame=single,
+  framerule=0pt,
+  xleftmargin=0.5em,
+  language=Python,
+  showstringspaces=false,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray}
+}
+% code tokens may break after an underscore so long names fit in narrow table columns
+\newcommand{\code}[1]{{\ttfamily\def\_{\textunderscore\allowbreak}#1}}
+
+\title{Spatial Void Feature Extraction from X-ray Images\texorpdfstring{\\
+\large Definitions, Computation and Relevance to Thermal Resistance Degradation}{: Definitions, Computation and Relevance to Thermal Resistance Degradation}}
+\author{AI 221 Project \\ Jocelyn de Castro, Joanna Marie Pagtalunan}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document explains the spatial void feature extraction pipeline implemented in the
+project notebook \code{jp\_void\_spatial\_features.ipynb}. It covers how the X-ray images of the
+\emph{hellastudy} LED dataset are registered, how a void-free reference image is built for each
+LED type, how solder pads are located, how voids are segmented, and how the final per-LED
+feature vector is assembled. For every extracted feature we give a definition, the formula or
+procedure used to compute it, its range, and the reason it is expected to carry information
+about thermal resistance degradation, drawing on the project proposal and the related
+literature in the \code{docs/} folder.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Motivation}
+% ===========================================================================
+
+The project proposal \cite{proposal} observes that industry acceptance criteria for solder
+voids (IPC-A-610, IPC-7095, IPC-7093, MIL-STD-883) are based almost entirely on the
+\emph{total} void area, typically a limit around 25\,\%. None of them relates the
+\emph{position} of a void to thermal performance. The proposal argues that a void of a given
+size located directly beneath the die on the thermal pad obstructs the primary heat path and
+should degrade thermal resistance more than an equally large void at the periphery of an
+electrical pad, yet both pass or fail the same way under current rules.
+
+The hellastudy dataset \cite{part1,part2} provides what is needed to test this: an X-ray image of
+every one of the 1\,800 LED solder joints at zero thermal shock cycles (TSC), plus transient
+thermal analysis (TTA) measurements of thermal resistance $R_{th}$ throughout 1\,500 cycles of
+thermal shock. Earlier work on this dataset predicted thermal properties from scanning acoustic
+microscopy (SAM) images using convolutional networks \cite{zippelius2022}, and later showed that
+SAM images add spatial information that TTA alone lacks and improve long-range reliability
+prediction \cite{zippelius2026}. Those studies let the network learn its own image features. Our
+approach is complementary: we extract a small set of \emph{interpretable} location-aware void
+descriptors from the X-ray images so that the contribution of void position can be examined
+directly and fed to classical learners (Random Forest, XGBoost, SVM) as well as an ANN.
+
+The notebook therefore has two goals:
+\begin{enumerate}[nosep]
+  \item Reproduce the void segmentation of Part~I of the hellastudy \cite{part1} closely enough
+        that the total void ratio matches the authors' own published per-LED values.
+  \item Go beyond the void ratio and compute where the voids sit on each pad.
+\end{enumerate}
+
+% ===========================================================================
+\section{Data}
+% ===========================================================================
+
+The X-ray images live in one folder per LED type under \path{data/raw/XRay/XRay/}, with file
+names of the form
+\begin{center}
+\path{XRay_<LED_TYPE>_<PASTE>_Panel<N>_LED<NN>_<TSC>TSC.jpg}
+\end{center}
+The regular expression in \code{parse\_filename} splits this into \code{led\_type}, \code{paste}, \code{panel},
+\code{led\_num} and \code{tsc}, and builds the key
+\code{unit\_id = <LED\_TYPE>\_<PASTE>\_P<panel>\_L<led\_num>} that is later used to join the
+features with the thermal-resistance target.
+
+\begin{itemize}[nosep]
+  \item 9 LED types $\times$ 5 solder pastes $\times$ 40 LEDs $=$ 1\,800 images, all at 0~TSC.
+  \item Image sizes range from $200\times200$ to $300\times300$ pixels and are constant
+        within an LED type.
+  \item Six files are placeholder pictures that only contain the word ``Missing''. They are
+        detected by \code{is\_placeholder} (more than 60\,\% of pixels at grey level $\geq 250$)
+        and excluded from the reference image; their feature rows are set to \code{NaN}.
+  \item Images are loaded as 8-bit greyscale. In X-ray, metal attenuates radiation, so pads
+        and solder appear \emph{dark} while voids appear \emph{bright} (Part~I,
+        \S III.A: ``voids appear brighter in the X-ray image since more radiation can pass
+        through the specimen due to missing metallic material'' \cite{part1}).
+\end{itemize}
+
+Pad counts per LED type are taken from Part~I \S II.A and Part~II Table~I \cite{part1,part2}:
+FC-SP1, FC-SP2 and FC-GB3 are symmetrical two-pad designs with no dedicated thermal pad; all
+other types have three pads, of which the largest is the thermal pad (Part~II \S II.A: ``for
+three-pad designs, the thermal pad is typically bigger compared to the electrical pads'').
+
+% ===========================================================================
+\section{Pipeline overview}
+% ===========================================================================
+
+Part~I of the hellastudy describes its void algorithm as follows (\S IV.A, Fig.~5): the outline
+of all LEDs of one type is detected, an average image is generated by overlapping all of them to
+obtain a ``void-less'' X-ray image, this average is subtracted from each device under test
+(DUT), and the result is thresholded \cite{part1}. The notebook follows the same idea with a
+more robust implementation, in six stages:
+
+\begin{enumerate}
+  \item \textbf{Grouping.} Images are processed one LED type at a time, because pad layout,
+        magnification and image size differ between types.
+  \item \textbf{Registration and reference image} (\S\ref{sec:registration}). All images of a
+        type are aligned to a common frame and their per-pixel \emph{median} is taken as the
+        void-free reference.
+  \item \textbf{Pad detection} (\S\ref{sec:pads}). The pads are found automatically as the
+        darkest connected components of the reference and assigned a role
+        (thermal or electrical).
+  \item \textbf{Void mask} (\S\ref{sec:voidmask}). The reference is fitted locally to each DUT
+        and subtracted. The residual is thresholded with hysteresis to produce a binary void
+        mask.
+  \item \textbf{Validation} (\S\ref{sec:validation}). The resulting void ratio of every LED is
+        compared with the authors' published values in
+        \code{data/raw/CrackVoid Ratios/Xray Void Ratio.csv}.
+  \item \textbf{Feature extraction} (\S\ref{sec:features}). Spatial features are computed per pad
+        in pad-normalised coordinates and aggregated per LED by pad role.
+\end{enumerate}
+
+The output is \code{data/processed/spatial\_void\_features.csv}, a matrix of 1\,799 rows (one
+LED is absent from the FC-GB2 folder) and 32 columns.
+
+% ===========================================================================
+\section{Registration and reference image}
+\label{sec:registration}
+% ===========================================================================
+
+A plain average of unaligned images blurs pad edges and internal structures, and those blurred
+edges then survive subtraction and get counted as voids. The notebook therefore registers each
+image before building the reference, in \code{register\_image} and \code{register\_led\_type}.
+
+\paragraph{Per image.}
+\begin{enumerate}[nosep]
+  \item \emph{Coarse translation search.} The central 76\,\% crop of the template is searched
+        over the DUT (padded by 60~px) with normalised cross-correlation
+        (\code{cv2.matchTemplate}, \code{TM\_CCOEFF\_NORMED}). This handles LEDs that sit tens of
+        pixels off-centre. The correlation score is kept as a quality indicator.
+  \item \emph{ECC refinement, Euclidean.} \code{cv2.findTransformECC} with
+        \code{MOTION\_EUCLIDEAN} refines the shift and adds rotation.
+  \item \emph{ECC refinement, affine (last pass only).} A second ECC run with
+        \code{MOTION\_AFFINE} absorbs the $\pm1.5\,\%$ magnification differences between shots.
+        The affine result is accepted only if both scale factors lie in $(0.94, 1.06)$.
+  \item The DUT is warped into the template frame. A \emph{validity mask} is produced by
+        warping an all-ones image the same way; pixels that fall outside the original frame are
+        marked invalid and excluded from all later statistics.
+\end{enumerate}
+
+\paragraph{Per LED type.} Three passes are run. Pass~1 aligns every image to the first real
+image of the type. Passes~2 and~3 align to the per-pixel \emph{median} of the previous pass
+(restricted to non-placeholder images with correlation score $> 0.5$). The median is used
+instead of the mean because voids are at random positions in different LEDs and the median
+suppresses them, whereas the mean leaves faint ghosts. The reference image is the median of the
+final pass. Registration results are cached in \code{\_REG\_CACHE}.
+
+% ===========================================================================
+\section{Pad detection}
+\label{sec:pads}
+% ===========================================================================
+
+Pads are located once per LED type on the reference image by \code{detect\_pads}. The physical
+basis is again X-ray attenuation: pad plus solder is the thickest metal stack in the image and
+therefore its darkest large region.
+
+\begin{enumerate}[nosep]
+  \item \emph{Dark-pixel mask.} By default Otsu's threshold (inverted). Several LED types use
+        a percentile override from \code{PAD\_THRESH\_OVERRIDE}, e.g.\ the darkest 40\,\% of
+        pixels for FC-SP4, FC-GB1 and VTF2, because the die or a bump grid competes with the pads
+        in darkness.
+  \item \emph{Iterative erosion.} The mask is eroded with a $3\times3$ kernel until at least
+        the expected number of components (2 or 3 from \code{PAD\_COUNT}) with area
+        $\geq 2\,\%$ of the image exist, up to \code{MAX\_EROSION\_OVERRIDE} passes (8, or 20
+        for VTF2). This separates pads that touch after thresholding without needing a visible
+        gap.
+  \item \emph{Keep the $N$ largest components.}
+  \item \emph{Dilate back and clip.} Each component is dilated by the same number of erosions
+        and intersected with the original dark-pixel mask, which recovers the full pad extent
+        without bleeding into a neighbour.
+  \item \emph{Role assignment.} For three-pad types the largest component is the
+        \emph{thermal} pad and the others are \emph{electrical}; for two-pad types both are
+        electrical.
+\end{enumerate}
+
+Each pad is stored as a bounding box $(x_0, y_0, x_1, y_1)$, a role and a pixel area, together
+with its exact pixel mask. For the FC-SP3 example in the notebook the thermal pad spans
+$156\times88$ pixels (13\,500 pad pixels) and the two electrical pads about $69\times88$
+pixels each.
+
+% ===========================================================================
+\section{Void mask extraction}
+\label{sec:voidmask}
+% ===========================================================================
+
+A plain difference $\mathrm{DUT} - \mathrm{reference}$ is not sufficient on these images: exposure
+and blur differ between shots, varying solder thickness adds slow brightness gradients, and the
+die, bumps and wire bonds sit in slightly different places relative to the pads. In the
+notebook's diagnostic cell, the plain difference inside pads has mean 1.6 and 99th percentile
+15 grey levels, which is of the same order as the void signal. The notebook therefore fits the
+reference to each DUT \emph{locally} before subtracting (\code{\_local\_residual}).
+
+\subsection{Local linear model}
+
+Within a Gaussian window of $\sigma_w = 8$~px around every pixel, the DUT is modelled as
+\begin{equation}
+  \mathrm{DUT}(x,y) \approx b + a\,\mathrm{ref} + c\,\frac{\partial\,\mathrm{ref}}{\partial x}
+  + d\,\frac{\partial\,\mathrm{ref}}{\partial y} + e\,\nabla^2 \mathrm{ref},
+  \label{eq:localfit}
+\end{equation}
+where the five regressors are built by \code{\_ref\_features} (the reference, its Sobel
+derivatives and its Laplacian, after a Gaussian blur of $\sigma = 1$). The coefficients have a
+physical reading:
+\begin{itemize}[nosep]
+  \item $a, b$: local contrast and brightness (exposure differences, solder-thickness gradients);
+  \item $c, d$: a local sub-pixel shift (first-order Taylor expansion of a translation);
+  \item $e$: a blur difference (first-order expansion of a Gaussian blur).
+\end{itemize}
+The normal equations are solved per pixel using Gaussian-weighted moments, with a small ridge
+penalty ($\lambda = 4$) that shrinks the contrast coefficient towards the \emph{global} gain
+$a_0$ estimated robustly by \code{\_global\_gain} (iteratively reweighted linear fit with a
+$2.5\sigma$ MAD cut). The fit is iterated three times; after each iteration, pixels whose
+residual exceeds $2\sigma$ (bright) or $-4\sigma$ (dark), with $\sigma$ the MAD-based robust
+scale, are removed from the fit weights. Because voids are \emph{not} present in the reference
+they remain in the residual, and because they are removed from the fit they do not pull the
+local brightness estimate upward.
+
+The residual is divided by $\max(a_0, 0.05)$ so that it is expressed in grey levels of the
+\emph{reference}, making the detection threshold comparable across shots with different
+exposure.
+
+\subsection{Regions}
+
+\code{build\_void\_context} prepares, once per LED type:
+\begin{itemize}[nosep]
+  \item \code{pad}: union of all pad masks;
+  \item \code{fit\_region}: pad dilated by 4~px (area over which the local fit is computed);
+  \item \code{detect\_region}: pad eroded by 2~px (voids are only accepted here, to stay away
+        from the pad outline where registration offsets concentrate);
+  \item \code{dark}: small very dark package features (bump grid, vias, wire-bond balls) found
+        by a black-hat transform with an $11\times11$ ellipse and dilated by 2~px. These are
+        never solder and are excluded from both fit and detection;
+  \item \code{edge\_dist}: Euclidean distance transform of the detect region, used to recognise
+        blobs hugging the pad outline.
+\end{itemize}
+
+\subsection{Thresholding and blob filtering}
+
+\code{extract\_void\_mask} applies a hysteresis threshold to the residual: a blob must exceed
+$T$ somewhere and is then grown down to $0.6\,T$. $T$ is set per LED type in \code{VOID\_T}
+(10 to 16 grey levels). Blobs are then filtered:
+\begin{itemize}[nosep]
+  \item area $< 8$~px are dropped (the reference CSV contains no void smaller than 8~px);
+  \item elongation (major/minor axis) $\geq 3$ with at least 60\,\% of pixels within 3~px of the
+        pad edge are dropped (pad or solder outline offsets);
+  \item elongation $\geq 4$ with major axis $\geq 30$~px are dropped (edges of shifted internal
+        structures).
+\end{itemize}
+What survives is the binary void mask for that DUT.
+
+\subsection{Calibration of \texorpdfstring{$T$}{T}}
+
+\code{calibrate\_threshold} sweeps $T$ from 6 to 20 for one LED type and compares the resulting
+per-LED void ratio with the CSV. For FC-SP3 the mean absolute error is minimised at $T = 12$
+(0.38 percentage points, Pearson $r = 0.92$), which is the value stored in \code{VOID\_T}. The
+same procedure was used for every type.
+
+% ===========================================================================
+\section{Validation against the published void ratios}
+\label{sec:validation}
+% ===========================================================================
+
+\code{Xray Void Ratio.csv} holds the hellastudy authors' own result for every LED (pad pixels,
+void count, void pixels, void ratio); its per-type means reproduce Table~III of Part~I
+\cite{part1}. One duplicated key (FC-SP4 / SAC105 / panel~2 / LED~7) is dropped as ambiguous.
+Table~\ref{tab:validation} compares the notebook's void ratio with the CSV for every LED type.
+
+\begin{table}[H]
+\centering
+\caption{Void ratio from this notebook versus the authors' CSV, per LED type.
+Errors are in percentage points of void ratio.}
+\label{tab:validation}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+LED type & $n$ & Ours mean [\%] & CSV mean [\%] & MAE [pt] & Pearson $r$ & Spearman $\rho$ \\
+\midrule
+FC-GB1 & 200 & 2.37 & 2.35 & 0.48 & 0.90 & 0.92 \\
+FC-GB2 & 199 & 1.31 & 1.34 & 0.24 & 0.95 & 0.92 \\
+FC-GB3 & 198 & 4.96 & 5.33 & 1.08 & 0.92 & 0.93 \\
+FC-SP1 & 200 & 0.45 & 0.51 & 0.25 & 0.49 & 0.71 \\
+FC-SP2 & 198 & 2.25 & 2.45 & 0.57 & 0.84 & 0.92 \\
+FC-SP3 & 200 & 2.33 & 2.37 & 0.38 & 0.92 & 0.94 \\
+FC-SP4 & 198 & 3.18 & 3.17 & 0.48 & 0.89 & 0.95 \\
+VTF1   & 198 & 2.58 & 2.86 & 0.75 & 0.79 & 0.82 \\
+VTF2   & 200 & 3.39 & 3.47 & 0.81 & 0.83 & 0.81 \\
+\midrule
+All    & 1\,791 & \multicolumn{2}{c}{} & 0.56 & 0.91 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The per-type means agree with Part~I Table~III to within a few tenths of a percentage point.
+FC-SP1 has the lowest correlation because its voiding is so small (mean 0.5\,\%) that a few
+pixels dominate the ratio. This validation matters because it shows the void masks on which all
+spatial features are built are consistent with the segmentation used by the original authors,
+so any predictive power we find for the spatial features is not an artefact of a different
+segmentation.
+
+% ===========================================================================
+\section{Spatial feature extraction}
+\label{sec:features}
+% ===========================================================================
+
+\subsection{Coordinate system}
+
+All features are computed by \code{pad\_features} on the void mask cropped to the pad bounding
+box, in \emph{pad-normalised coordinates}: the pad centre is $(0,0)$ and the corners are
+$(\pm1,\pm1)$. For a pad of width $w$ and height $h$ pixels and a void pixel at image column $x$
+and row $y$ within the crop,
+\begin{equation}
+  \tilde{x} = \frac{x - w/2}{w/2}, \qquad \tilde{y} = \frac{y - h/2}{h/2}.
+\end{equation}
+This normalisation makes features comparable across LED types whose pads range from
+$0.3$~mm$^2$ to $2.7$~mm$^2$ \cite{part2}. Note that the image $y$ axis points \emph{down}, so
+$\tilde{y} < 0$ means the upper half of the pad as seen in the image, and the quadrant labels
+NW, NE, SW, SE refer to the image frame (N = top of the image). For a three-pad LED imaged as
+in the notebook figures, the thermal pad is above the two electrical pads, so ``S'' on the
+thermal pad is the side facing the electrical pads and the inter-pad gap.
+
+\subsection{Per-pad features}
+
+Table~\ref{tab:padfeatures} defines the eleven features computed for each pad. In the formulas,
+$V$ is the set of void pixels inside the pad crop, $|V|$ its cardinality, $A_{\mathrm{pad}} = w\,h$
+the bounding-box area, and $\{R_k\}$ the connected components (8-connectivity, via
+\code{skimage.measure.label}) of the void mask inside the crop.
+
+\begin{longtable}{L{2.8cm} L{4.4cm} L{5.2cm} L{2.3cm}}
+\caption{Per-pad spatial void features computed by \code{pad\_features}.}
+\label{tab:padfeatures}\\
+\toprule
+\textbf{Feature} & \textbf{Definition} & \textbf{How the value is obtained} & \textbf{Range} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Feature} & \textbf{Definition} & \textbf{How the value is obtained} & \textbf{Range} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\code{void\_area\_frac} &
+Fraction of the pad area occupied by voids. &
+$|V| / A_{\mathrm{pad}}$, i.e.\ \code{pad\_crop.sum() / (pad\_h * pad\_w)}. Uses the
+bounding-box area as denominator; for the near-rectangular pads in this dataset this is close
+to the exact pad-mask area used for \code{void\_ratio}. &
+$[0, 1]$ \\
+
+\code{centroid\_x} &
+Horizontal position of the void centre of mass, relative to the pad centre. &
+Mean column of all void pixels, normalised: $(\bar{x} - w/2)/(w/2)$. $-1$ = left edge, $0$ =
+centre, $+1$ = right edge. Set to 0 when the pad has no voids. &
+$[-1, 1]$ \\
+
+\code{centroid\_y} &
+Vertical position of the void centre of mass, relative to the pad centre. &
+Mean row of all void pixels, normalised: $(\bar{y} - h/2)/(h/2)$. $-1$ = top edge (image
+frame), $+1$ = bottom edge. Set to 0 when there are no voids. &
+$[-1, 1]$ \\
+
+\code{q\_NW}, \code{q\_NE}, \code{q\_SW}, \code{q\_SE} &
+Share of the void pixels that lie in each quadrant of the pad. &
+Pad is split at $x = w/2$ and $y = h/2$. Each value is (void pixels in that quadrant)
+$/\,|V|$; the four values sum to 1. All 0 when there are no voids. &
+$[0, 1]$ each \\
+
+\code{cluster\_count} &
+Number of separate voids on the pad. &
+Number of connected components $\{R_k\}$ of the void mask inside the crop. &
+$\{0, 1, 2, \dots\}$ \\
+
+\code{mean\_circularity} &
+Average roundness of the voids. &
+For each component, circularity $= 4\pi A_k / P_k^2$ with $A_k$ the area and $P_k$ the
+perimeter from \code{regionprops}; then the mean over components. A perfect disc gives 1,
+elongated or ragged shapes give smaller values (pixelisation can push it slightly above 1 for
+tiny blobs). \code{NaN} when there are no voids. &
+$(0, \approx 1]$ or \code{NaN} \\
+
+\code{largest\_void\_frac} &
+Area of the single biggest void as a fraction of the pad. &
+$\max_k A_k / A_{\mathrm{pad}}$. Equals \code{void\_area\_frac} when there is only one void. &
+$[0, 1]$ \\
+
+\code{edge\_proximity\_min} &
+How close the nearest void comes to the pad edge, normalised so that 1 means the pad centre. &
+A Euclidean distance transform is computed from the crop border inward
+(\code{ndi.distance\_transform\_edt}); the minimum of that distance over all void pixels is
+divided by $\min(w, h)/2$. 0 = a void touches the border, 1 = the closest void pixel is at the
+pad centre. \code{NaN} when there are no voids. &
+$[0, 1]$ or \code{NaN} \\
+\end{longtable}
+
+\subsection{Per-LED aggregation}
+
+\code{led\_feature\_vector} turns the per-pad dictionaries into one row per LED. The thermal pad
+is kept separately because it is the primary heat path; the electrical pads (one or two) are
+averaged because the dataset does not identify anode and cathode. Table~\ref{tab:ledcolumns}
+lists every column of the final matrix.
+
+\begin{longtable}{L{4.6cm} L{10.6cm}}
+\caption{Columns of \code{spatial\_void\_features.csv} (one row per LED, keyed by \code{unit\_id}).}
+\label{tab:ledcolumns}\\
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\code{led\_type}, \code{paste}, \code{panel}, \code{led\_num} &
+Metadata parsed from the file name. \code{led\_type} and \code{paste} are the categorical inputs
+that the related work found important \cite{zippelius2026}. \\
+\code{has\_thermal\_pad} &
+1 for three-pad designs (FC-SP3, FC-SP4, FC-GB1, FC-GB2, VTF1, VTF2), 0 for two-pad designs
+(FC-SP1, FC-SP2, FC-GB3). \\
+\code{thermal\_<feature>} (11 columns) &
+The eleven per-pad features of Table~\ref{tab:padfeatures} evaluated on the thermal pad.
+\code{NaN} for two-pad LEDs. \\
+\code{electrical\_mean\_<feature>} (11 columns) &
+The eleven per-pad features averaged over all electrical pads of the LED, ignoring \code{NaN}
+entries (e.g.\ circularity of a void-free pad). \\
+\code{pad\_px} &
+Number of valid pad pixels (union of all pad masks, intersected with the registration
+validity mask). Same definition as the CSV column of the original authors. \\
+\code{void\_count} &
+Total number of connected void components on the whole LED. \\
+\code{void\_px} &
+Total number of void pixels on the whole LED. \\
+\code{void\_ratio} &
+\code{void\_px / pad\_px}. This is the conventional total void ratio and the quantity validated
+in Table~\ref{tab:validation}. It plays the role of the \emph{baseline} feature in the project. \\
+\code{image\_missing} &
+1 if the X-ray file was a ``Missing'' placeholder; all feature columns are then \code{NaN}. \\
+\end{longtable}
+
+Column count: 4 metadata $+$ 1 \code{has\_thermal\_pad} $+$ 11 thermal $+$ 11 electrical $+$
+4 whole-LED statistics $+$ 1 \code{image\_missing} $=$ 32.
+
+% ===========================================================================
+\section{Why these features are relevant to thermal degradation}
+\label{sec:relevance}
+% ===========================================================================
+
+The physical argument throughout the literature is that heat generated at the LED junction
+flows through the die, the submount, the solder joint and the substrate to the heat sink. Any
+loss of metallic cross-section in the solder reduces the area available for conduction and so
+raises the thermal resistance $R_{th}$ \cite{part1,zippelius2022}. Voids remove cross-section
+at time zero; cracks remove it progressively during thermal cycling. The features in
+Table~\ref{tab:padfeatures} describe \emph{how much} cross-section is lost and \emph{where}.
+Table~\ref{tab:relevance} connects each feature to a specific finding in the proposal or the
+reference papers.
+
+\begin{longtable}{L{3.4cm} L{11.8cm}}
+\caption{Relevance of each feature to thermal resistance degradation, with supporting evidence.}
+\label{tab:relevance}\\
+\toprule
+\textbf{Feature(s)} & \textbf{Why it should matter} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Feature(s)} & \textbf{Why it should matter} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+
+\code{void\_ratio}, \code{void\_area\_frac} &
+The conventional metric and the only one used by IPC/MIL acceptance criteria \cite{proposal}.
+Part~I found a measurable linear increase of the solder-and-substrate resistance $R_{th\text{-}S\&S}$
+with void ratio for the two LED types with the smallest pad areas, FC-SP1 and FC-GB3
+(Table~VI of \cite{part1}: $+0.030$ and $+0.016$~K/W per percent of voiding), and the authors
+explain it by the reduction of conducting cross-section. For the other types the effect was
+within noise at the low (under 5\,\%) voiding achieved by vacuum reflow. This is exactly why the
+proposal argues that \emph{total} area is an insufficient descriptor and motivates the baseline
+versus spatial comparison in the project plan: the spatial model must beat a model that already
+knows the void ratio, LED type and paste. \\
+
+\code{thermal\_*} vs.\ \code{electrical\_mean\_*} split, \code{has\_thermal\_pad} &
+The thermal pad sits directly below the die and is the primary heat path for three-pad designs
+(Part~I \S II.A: an ``electrical isolated pad below the die for improved heat management''
+\cite{part1}). Part~II reports from simulation that ``cracks in the thermal pad have higher
+thermal impact than cracks in the electrical pads'' \cite{part2}; the same geometric argument
+applies to voids. Keeping thermal-pad features separate lets a model weight them differently
+from electrical-pad features. Two-pad LEDs route all heat through their electrical pads, so
+\code{has\_thermal\_pad} tells the model which regime applies. Part~II also found that pad
+design (pad area, inter-pad gap, thermal-to-electrical pad ratio) drives lifetime, so pad role
+is a meaningful axis. \\
+
+\code{centroid\_x}, \code{centroid\_y} &
+First-order summary of \emph{where} the void mass is. The proposal's central hypothesis is that
+a void under the heat source is worse than the same void at the periphery \cite{proposal}.
+TTA theory in \cite{zippelius2022,zippelius2026} notes that the position of a defect along the
+thermal path changes when it appears in the $Z_{th}(t)$ curve; laterally, a void centred under
+the die intercepts the densest heat flux. A centroid near $(0,0)$ on the thermal pad therefore
+flags the geometry the proposal is most concerned about. \\
+
+\code{q\_NW}, \code{q\_NE}, \code{q\_SW}, \code{q\_SE} &
+A coarse spatial histogram that captures asymmetry the centroid alone cannot (two voids in
+opposite corners have a central centroid but zero central mass). SAM images of the aged joints
+show that cracking under thermal shock ``proceeds from the corners inwards''
+\cite{zippelius2026}, and Part~II reports that ``intense cracking in a single solder pad has
+higher thermal impact than a homogeneous crack distribution'' \cite{part2}. Quadrant shares show whether voids are concentrated in one
+corner, where they would merge early with an advancing crack front, or spread evenly. For the
+thermal pad the southern quadrants face the inter-pad gap, so the split also encodes
+orientation relative to the other pads. \\
+
+\code{largest\_void\_frac} &
+Part~I states that ``too high void ratios in one interconnect, especially single big voids, lead
+to an earlier separation because the heat flow inside the LED package is changed'' \cite{part1}.
+IPC-7095 and IPC-7093 likewise address the size of an individual void in addition to the total
+\cite{proposal}. A single large void blocks a contiguous area of the heat path, while the same
+area split into many small voids leaves conduction paths between them. \\
+
+\code{cluster\_count} &
+Complements \code{largest\_void\_frac}: for the same total area, many small voids versus one
+large void correspond to the homogeneous versus concentrated distributions that Part~II found to
+have different thermal impact \cite{part2}. Void count is also one of the columns the hellastudy
+authors recorded in their own CSV, so it is part of the established description of the joint. \\
+
+\code{mean\_circularity} &
+Gas voids formed during reflow are approximately circular. Irregular or elongated bright
+regions in X-ray are more likely non-wetted areas or contamination, which Part~I notes are also
+detected by X-ray and were suspected for FC-GB3's high voiding (surface-finish contamination)
+\cite{part1}. Non-wetting is an interface defect that both reduces heat transfer and weakens
+the mechanical bond, so shape carries information about the defect mechanism, not just its
+area. \\
+
+\code{edge\_proximity\_min} &
+Thermo-mechanical cracks initiate at pad corners and edges where the CTE-mismatch stress is
+highest and grow inward \cite{part2,zippelius2026}. A void that already touches the pad edge
+shortens the remaining ligament a crack must traverse and removes anchoring at the most stressed
+location, so it may accelerate the $R_{th}$ rise during cycling. Conversely, the proposal's
+concern is a void in the centre; a high \code{edge\_proximity\_min} on the thermal pad indicates
+that scenario. The feature therefore spans both failure narratives. \\
+\end{longtable}
+
+\paragraph{Connection to the related machine-learning work.}
+Zippelius et al.\ \cite{zippelius2022} showed that a CNN can translate SAM images of these same
+LEDs into TTA quantities ($R_{th}$, $B_{max}$, $z_{max}$), establishing that inspection images
+contain information about thermal state. Their 2026 follow-up \cite{zippelius2026} found that
+adding SAM images to TTA features gives a clear accuracy gain for pass/fail prediction of
+$R_{th}$ degradation, and attributes part of this to the image encoding pad shape and location
+information that TTA cannot provide. Both studies learn image features implicitly. Our explicit
+features make the same spatial information available to models that cannot consume images
+(Random Forest, XGBoost, SVM) and allow feature-importance analysis to answer the proposal's
+question directly: does void \emph{location} add predictive value beyond void \emph{amount}?
+
+% ===========================================================================
+\section{Limitations and practical notes}
+% ===========================================================================
+
+\begin{itemize}
+  \item \textbf{Low voiding.} Because the study used vacuum reflow, the average void ratio is
+        below 4\,\% for all types except FC-GB3 \cite{part1}, and Part~II found no
+        correlation between void ratio and lifetime at these levels \cite{part2}. Any signal
+        from spatial features will be subtle; the thermal-pad features of high-voiding LEDs are
+        where it is most likely to appear.
+  \item \textbf{Missing values.} \code{mean\_circularity} and \code{edge\_proximity\_min} are
+        \code{NaN} for void-free pads, and all \code{thermal\_*} columns are \code{NaN} for
+        two-pad LEDs. These must be imputed or handled explicitly before PCA, UMAP, K-Means or
+        SVM, which do not accept \code{NaN}. Tree models can use an indicator plus a sentinel.
+  \item \textbf{Denominator.} \code{void\_area\_frac} divides by the bounding-box area while
+        \code{void\_ratio} divides by the exact pad-mask pixel count; they differ slightly for
+        pads whose mask is not a full rectangle.
+  \item \textbf{Orientation.} Quadrant and centroid signs are in the image frame. They are
+        consistent within an LED type (all images are registered to one frame) but the physical
+        meaning of ``north'' may differ between types depending on how the panel was imaged.
+  \item \textbf{Electrical pads are averaged.} If anode and cathode behave differently, the
+        averaging hides it. The notebook's next-steps section suggests replacing
+        \code{electrical\_mean\_*} with position-indexed per-pad columns if that matters.
+  \item \textbf{Threshold sensitivity.} \code{VOID\_T} is calibrated against the authors' CSV.
+        If registration or the local fit is changed, \code{calibrate\_threshold} must be re-run.
+  \item \textbf{X-ray only.} SAM is deliberately not used for initial void detection because
+        Part~I found it less sensitive than X-ray for small voids \cite{part1}; it becomes
+        relevant for crack tracking during ageing, which is outside this notebook.
+\end{itemize}
+
+% ===========================================================================
+\section{Next steps in the project}
+% ===========================================================================
+
+\begin{enumerate}[nosep]
+  \item Join the feature matrix with \code{rth\_start\_end.csv} on \code{unit\_id}, derive the
+        cycles-to-failure using Part~II's criterion of a 20\,\% relative increase in $R_{th}$
+        \cite{part2}, and discretise into the degradation classes.
+  \item Fit a baseline model on \code{led\_type}, \code{paste} and \code{void\_ratio}, then a
+        spatial model that adds all \code{thermal\_*} and \code{electrical\_mean\_*} columns,
+        and compare cross-validated per-class F1.
+  \item Use PCA/UMAP and feature importances to identify which spatial descriptors drive any
+        improvement, which is the direct test of the hypothesis in the proposal.
+\end{enumerate}
+
+% ===========================================================================
+\begin{thebibliography}{9}
+
+\bibitem{proposal}
+J.~de Castro and J.~M.~Pagtalunan, ``AI221 Project Proposal: Machine Learning-Based
+Classification of Thermal Resistance Degradation in Solder Joints Using Void Spatial
+Distribution Features from X-ray Images,'' November 2026.
+(\code{docs/AI\_221\_Project\_Proposal.pdf})
+
+\bibitem{part1}
+M.~Schmid, A.~Zippelius, A.~Han\ss{}, S.~B\"ockhorst, and G.~Elger, ``Investigations on
+High-Power LEDs and Solder Interconnects in Automotive Application: Part~I---Initial
+Characterization,'' \emph{IEEE Trans.\ Device Mater.\ Rel.}, vol.~22, no.~2, pp.~175--186,
+June 2022.
+
+\bibitem{part2}
+M.~Schmid, A.~Zippelius, A.~Han\ss{}, S.~B\"ockhorst, and G.~Elger, ``Investigations on
+High-Power LEDs and Solder Interconnects in Automotive Application: Part~II---Reliability,''
+\emph{IEEE Trans.\ Device Mater.\ Rel.}, vol.~23, no.~3, pp.~419--429, Sept.\ 2023.
+
+\bibitem{zippelius2022}
+A.~Zippelius, J.~Hermann, T.~Strobl, A.~Hoffmann, M.~Schmid, and G.~Elger, ``Predicting thermal
+resistance of solder joints based on Scanning Acoustic Microscopy using Artificial Neural
+Networks,'' in \emph{Proc.\ IEEE 9th Electronics System-Integration Technology Conference
+(ESTC)}, 2022, pp.~566--575.
+
+\bibitem{zippelius2026}
+A.~Zippelius, Z.~Mohd, M.~Schmid, and G.~Elger, ``Comparison of Different Input Data for the
+Prediction of LED Solder Joints Using Artificial Neural Networks,'' \emph{IEEE Trans.\ Device
+Mater.\ Rel.}, vol.~26, no.~1, pp.~157--166, March 2026.
+
+\end{thebibliography}
+
+\end{document}
