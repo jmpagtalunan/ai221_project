@@ -8,3 +8,13 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# DHC-apps-AI-eng-platform: local-only, never commit
+# (connector stubs, skill stubs and prompts from sync-connectors.py, plus the workspace file that links the platform)
+.github/agents/
+.claude/agents/
+.github/skills/adi-dhc-*/
+.claude/skills/adi-dhc-*/
+.github/prompts/adi-dhc-*.prompt.md
+.claude/
+ai221_project.code-workspace
